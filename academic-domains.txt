@@ -1,0 +1,18 @@
+# 常见CS论文与期刊网站域名列表
+ieeexplore.ieee.org
+ieee.org
+dl.acm.org
+acm.org
+usenix.org
+link.springer.com
+springer.com
+sciencedirect.com
+onlinelibrary.wiley.com
+wiley.com
+nature.com
+aclanthology.org
+openreview.net
+papers.nips.cc
+proceedings.neurips.cc
+openaccess.thecvf.com
+icml.cc
