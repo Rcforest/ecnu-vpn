@@ -1,300 +1,289 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# === 载入 .env（位于脚本同目录）===
+############################################################
+# ECNU VPN one-touch (macOS)
+# - 默认：全局模式（标准 vpnc-script 改默认路由/DNS）
+# - 分流：--split 使用 vpn-slice，仅清单域名走 VPN
+# - 密码来源：VPN_PASS_FILE > VPN_PASS > Keychain
+# - PID/日志：可通过 .env 配置；相对路径会按脚本目录绝对化
+############################################################
+
+########## 目录/路径 ##########
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$SCRIPT_DIR/.env" ]; then
-  set -a; . "$SCRIPT_DIR/.env"; set +a
-fi
 
-# === PATH ===
-export PATH="${PATH:-/usr/bin:/bin}"
-for p in /opt/homebrew/bin /usr/local/bin; do
-  [ -d "$p" ] && PATH="$p:$PATH"
-done
+# 尝试加载 .env（可选）
+[ -f "$SCRIPT_DIR/.env" ] && . "$SCRIPT_DIR/.env"
 
-# === 基础配置（支持 .env 覆盖）===
+# 默认配置（可被 .env 覆盖）
 VPN_HOST="${VPN_HOST:-vpn-ct.ecnu.edu.cn}"
-: "${VPN_USER:?Set VPN_USER in environment or .env}"
+VPN_USER="${VPN_USER:-}"                              # ← 必填（学号/工号）
 KEYCHAIN_LABEL="${KEYCHAIN_LABEL:-ECNU_VPN}"
 USERAGENT="${USERAGENT:-AnyConnect Windows 4.10.06079}"
-AUTHGROUP="${AUTHGROUP-}"
-SECOND_FACTOR="${SECOND_FACTOR-}"
-SERVERCERT_PIN="${SERVERCERT_PIN-}"
+AUTHGROUP="${AUTHGROUP-}"                             # 可选
+SECOND_FACTOR="${SECOND_FACTOR-}"                     # 可选（push 或 6位码）
+SERVERCERT_PIN="${SERVERCERT_PIN-}"                   # 可选 pin-sha256:BASE64
 
-# 可执行文件：优先 env 指定，其次自动发现
-if [ -z "${OPENCONNECT_BIN-}" ]; then
-  if command -v openconnect >/dev/null 2>&1; then
-    OPENCONNECT_BIN="$(command -v openconnect)"
-  elif command -v brew >/dev/null 2>&1 && brew --prefix openconnect >/dev/null 2>&1; then
-    OPENCONNECT_BIN="$(brew --prefix openconnect 2>/dev/null)/bin/openconnect"
-  else
-    echo "❌ 未找到 openconnect，请先安装（brew install openconnect）" >&2
-    exit 1
-  fi
-fi
+TMPDIR="${TMPDIR:-$SCRIPT_DIR/tmp}"
+LOGFILE="${LOGFILE:-$TMPDIR/ecnu-vpn.log}"
+PIDFILE="${PIDFILE:-$TMPDIR/openconnect-ecnu.pid}"
+DOMAINS_FILE="${DOMAINS_FILE:-$SCRIPT_DIR/domains.txt}"
 
-# 组件路径：默认相对脚本目录（.env 可覆盖）
-VPN_SCRIPT="${VPN_SCRIPT:-$SCRIPT_DIR/vpnc-noroute.sh}"
-SPLIT_MODULE="${SPLIT_MODULE:-$SCRIPT_DIR/ecnu-split.sh}"
-DOMAINS_FILE_DEFAULT="${DOMAINS_FILE_DEFAULT:-$SCRIPT_DIR/academic-domains.txt}"
+# 默认行为：不开 split => 全局模式
+WANT_SPLIT="${AUTO_SPLIT:-0}"
 
-# === 运行时文件 ===
-LOGFILE="${LOGFILE:-./tmp/ecnu-vpn.log}"
-PIDFILE="${PIDFILE:-./tmp/openconnect-ecnu.pid}"
-SPLIT_ROUTES_FILE="${SPLIT_ROUTES_FILE:-./tmp/ecnu-vpn.split-routes}"
-SPLIT_LOGFILE="${SPLIT_LOGFILE:-./tmp/ecnu-vpn-routes.log}"
-
-# 分流子模块（可选）
-SPLIT_MODULE="${SPLIT_MODULE:-$HOME/Projects/scripts/ecnu-vpn/ecnu-split.sh}"
-DOMAINS_FILE_DEFAULT="${DOMAINS_FILE_DEFAULT:-$HOME/Projects/scripts/ecnu-vpn/academic-domains.txt}"
-
-PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
-
-# === 把相对路径规范化为绝对路径（相对于脚本目录）===
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-
-make_abs() {
-  # $1=var_name
-  local v; v="${!1-}"
-  [ -z "$v" ] && return 0
-  case "$v" in
-    /*) : ;;                                # 已经是绝对路径
-    *)  printf -v "$1" "%s/%s" "$SCRIPT_DIR" "$v" ;;
-  esac
-}
-
+# 路径绝对化（相对脚本目录）
+make_abs() { local v; v="${!1-}"; [ -z "$v" ] && return 0; case "$v" in /*) ;; *) printf -v "$1" "%s/%s" "$SCRIPT_DIR" "$v" ;; esac; }
+make_abs TMPDIR
 make_abs LOGFILE
 make_abs PIDFILE
-make_abs SPLIT_ROUTES_FILE
-make_abs SPLIT_LOGFILE
-make_abs DOMAINS_FILE_DEFAULT
-make_abs VPN_SCRIPT
-make_abs SPLIT_MODULE
+make_abs DOMAINS_FILE
 
-mkdir -p "$(dirname "$LOGFILE")" \
-         "$(dirname "$SPLIT_LOGFILE")" \
-         "$(dirname "$PIDFILE")" \
-         "$(dirname "$SPLIT_ROUTES_FILE")"
+mkdir -p "$TMPDIR"
 
+# PATH（优先 Homebrew）
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+
+########## 可执行体 ##########
+OPENCONNECT_BIN="$(command -v openconnect || true)"
+: "${OPENCONNECT_BIN:?未找到 openconnect，请先 brew install openconnect}"
+export OPENCONNECT_BIN
+
+# 标准 vpnc-script（全局模式用）
+VPN_SCRIPT_GLOBAL="${VPN_SCRIPT_GLOBAL-}"
+if [ -z "${VPN_SCRIPT_GLOBAL-}" ]; then
+  for p in /opt/homebrew/etc/vpnc/vpnc-script /usr/local/etc/vpnc/vpnc-script /etc/vpnc/vpnc-script; do
+    [ -x "$p" ] && VPN_SCRIPT_GLOBAL="$p" && break
+  done
+fi
+: "${VPN_SCRIPT_GLOBAL:?未找到标准 vpnc-script；请先 brew install openconnect}"
+
+# vpn-slice（分流模式用）
+VPN_SLICE_BIN="$(command -v vpn-slice || true)"  # 分流时才强制需要
+VPN_SLICE_WRAPPER="$TMPDIR/vpn-slice-wrapper.sh" # 动态生成的小封装
+
+########## 工具函数 ##########
 log(){ echo "[$(date '+%F %T')] $*" | tee -a "$LOGFILE" >&2; }
 is_running(){ [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
-ensure_sudo(){ [ "$(id -u)" -ne 0 ] && { sudo -n -v 2>/dev/null || { log "🔐 需要管理员密码（sudo -v）"; sudo -v; }; } || true; }
+ensure_sudo(){ [ "$(id -u)" -eq 0 ] || sudo -v; }
 
-# ---- 密码 ----
+# 解析参数
+SUBCMD="${1:-}"
+shift || true
+while (( "$#" )); do
+  case "$1" in
+    --split)    WANT_SPLIT=1 ;;
+    --no-split) WANT_SPLIT=0 ;;
+    *)          # 允许透传未知参数（若未来扩展）
+                ;;
+  esac
+  shift || true
+done
+
+# Keychain / 环境 读取密码（带清理 & 2FA 拼接）
 get_password() {
   : "${VPN_USER:?VPN_USER must not be empty}"
-  KEYCHAIN_LABEL="${KEYCHAIN_LABEL:-ECNU_VPN}"
-
-  # —— 优先级：VPN_PASS_FILE > VPN_PASS > Keychain ——
+  local pass
   if [ -n "${VPN_PASS_FILE-}" ]; then
-    if [ -r "$VPN_PASS_FILE" ]; then
-      PASS="$(/bin/cat -- "$VPN_PASS_FILE")"
-      log "🔑 已从文件读取密码（$VPN_PASS_FILE）"
-    else
-      log "❌ VPN_PASS_FILE 指向的文件不可读：$VPN_PASS_FILE"
-      exit 1
-    fi
-
+    [ -r "$VPN_PASS_FILE" ] || { log "❌ VPN_PASS_FILE 不可读：$VPN_PASS_FILE"; exit 1; }
+    pass="$(/bin/cat -- "$VPN_PASS_FILE")"
+    log "🔑 已从文件读取密码（$VPN_PASS_FILE）"
   elif [ -n "${VPN_PASS-}" ]; then
-    PASS="$VPN_PASS"
+    pass="$VPN_PASS"
     log "🔑 已从环境变量读取密码"
-
   else
     log "🔑 正在从钥匙串读取密码（account=$VPN_USER service=${KEYCHAIN_LABEL}）"
-    if PASS="$(
+    if pass="$(
       /usr/bin/perl -e 'alarm 3; exec @ARGV' \
         /usr/bin/security find-generic-password \
-        -a "$VPN_USER" -s "${KEYCHAIN_LABEL}" -w </dev/null 2>/dev/null
-    )"; then
-      :
-    elif [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER-}" ] && PASS="$(
+        -a "$VPN_USER" -s "$KEYCHAIN_LABEL" -w </dev/null 2>/dev/null
+    )"; then :; elif [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER-}" ] && pass="$(
       /usr/bin/perl -e 'alarm 3; exec @ARGV' \
         sudo -u "$SUDO_USER" /usr/bin/security find-generic-password \
-        -a "$VPN_USER" -s "${KEYCHAIN_LABEL}" -w </dev/null 2>/dev/null
-    )"; then
-      :
-    else
+        -a "$VPN_USER" -s "$KEYCHAIN_LABEL" -w </dev/null 2>/dev/null
+    )"; then :; else
       log "❌ 无法从钥匙串读取密码（account=$VPN_USER service=${KEYCHAIN_LABEL}）"
-      echo "   解决A：security add-generic-password -a \"$VPN_USER\" -s \"${KEYCHAIN_LABEL}\" -w" >&2
-      echo "   解决B：在 .env 里设置 VPN_PASS 或 VPN_PASS_FILE" >&2
+      echo "   解决A：security add-generic-password -a \"$VPN_USER\" -s \"$KEYCHAIN_LABEL\" -w" >&2
+      echo "   解决B：在 .env 中设置 VPN_PASS 或 VPN_PASS_FILE" >&2
       exit 1
     fi
   fi
-
-  # 规范化 & 2FA 拼接（不在日志里打印明文或长度）
-  PASS="${PASS%$'\n'}"
+  # 清理不可见字符/尾部空白
+  pass="${pass%$'\n'}"; pass="${pass%$'\r'}"; pass="$(printf '%s' "$pass" | sed -e 's/[[:space:]]\+$//')"
+  # 二次认证拼接
   if [ -n "${SECOND_FACTOR-}" ]; then
-    PASS="${PASS},${SECOND_FACTOR}"
+    pass="${pass},${SECOND_FACTOR}"
     log "🔒 已启用二次认证（SECOND_FACTOR）"
+  fi
+  printf '%s' "$pass"
+}
+
+# 保存/恢复默认路由（下线兜底；分流路径一般不需要改 default）
+save_default_route(){
+  local info; if info="$(route -n get default 2>/dev/null)"; then
+    ORIG_GW="$(printf '%s\n' "$info" | awk '/gateway:/{print $2; exit}')"
+    ORIG_IF="$(printf '%s\n' "$info" | awk '/interface:/{print $2; exit}')"
+    printf "%s %s\n" "${ORIG_GW-}" "${ORIG_IF-}" > "$TMPDIR/.orig-gw"
+  fi
+}
+restore_default_route(){
+  if [ -s "$TMPDIR/.orig-gw" ]; then
+    read -r ORIG_GW ORIG_IF < "$TMPDIR/.orig-gw" || true
+    if [ -n "${ORIG_GW-}" ]; then
+      ensure_sudo
+      sudo route -n delete default >/dev/null 2>&1 || true
+      sudo route -n add default "$ORIG_GW" >/dev/null 2>&1 || true
+      log "↩️ 已恢复默认路由：$ORIG_GW ($ORIG_IF)"
+    fi
+    rm -f "$TMPDIR/.orig-gw"
   fi
 }
 
-# ---- 连接 ----
+# 生成 vpn-slice 的 wrapper（把 domains.txt 展开为参数传给它）
+# 函数：make_vpn_slice_wrapper（替换你脚本里的同名函数）
+make_vpn_slice_wrapper(){
+  : "${VPN_SLICE_BIN:?未找到 vpn-slice；分流需先安装（brew install vpn-slice 或 pipx install vpn-slice）}"
+  cat > "$VPN_SLICE_WRAPPER" <<'EOF'
+#!/bin/sh
+set -eu
+DOMAINS_FILE="__DOMAINS_FILE__"
+VPN_SLICE_BIN="__VPN_SLICE_BIN__"
+
+# 读取 domains.txt（去注释与空行），用 POSIX 方式拼接参数
+DOMAINS_ARGS=""
+while IFS= read -r line || [ -n "$line" ]; do
+  clean="$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  [ -z "$clean" ] && continue
+  case "$clean" in \#*) continue ;; esac
+  DOMAINS_ARGS="${DOMAINS_ARGS} ${clean}"
+done < "$DOMAINS_FILE"
+
+# 调用 vpn-slice：-v 冗长日志；不再带 --no-dns（该参数不存在）
+# shellcheck disable=SC2086
+exec "$VPN_SLICE_BIN" -v $DOMAINS_ARGS
+EOF
+  /usr/bin/sed -i '' "s#__DOMAINS_FILE__#${DOMAINS_FILE}#g" "$VPN_SLICE_WRAPPER"
+  /usr/bin/sed -i '' "s#__VPN_SLICE_BIN__#${VPN_SLICE_BIN}#g" "$VPN_SLICE_WRAPPER"
+  chmod +x "$VPN_SLICE_WRAPPER"
+}
+
+# 启动 openconnect（密码走 stdin；记录 PIDFILE；追加日志）
 run_openconnect(){
-  local args=()
+  local pass args=()
+  pass="$(get_password)"
+
   args+=("https://${VPN_HOST}")
   args+=(--protocol=anyconnect)
   args+=(--user="$VPN_USER")
   args+=(--useragent="$USERAGENT")
   args+=(--passwd-on-stdin)
-  args+=(--script="$VPN_SCRIPT")        # 只配置 utun；不改默认路由/DNS
+  args+=(--script="$VPN_SCRIPT")
   args+=(--background --pid-file="$PIDFILE" --timestamp --verbose)
-  [ -n "${AUTHGROUP-}" ] && args+=(--authgroup "$AUTHGROUP")
-  [ -n "${SERVERCERT_PIN-}" ] && args+=(--servercert "pin-sha256:${SERVERCERT_PIN}")
-  printf "%s" "$PASS" | sudo env PATH="$PATH" "$OPENCONNECT_BIN" "${args[@]}"
+
+  [ -n "${AUTHGROUP-}" ]     && args+=(--authgroup "$AUTHGROUP")
+  [ -n "${SERVERCERT_PIN-}" ]&& args+=(--servercert "pin-sha256:${SERVERCERT_PIN}")
+  [ -n "${OPENCONNECT_DEBUG-}" ] && args+=(-vvv)
+
+  log "OC cmd: $OPENCONNECT_BIN --protocol=anyconnect --user=$VPN_USER --script=\"$VPN_SCRIPT\" --background --pid-file=\"$PIDFILE\" https://$VPN_HOST"
+  ensure_sudo
+  # 把 stdin 明确传给 openconnect
+  if ! printf "%s" "$pass" | sudo -E bash -c 'exec "$OPENCONNECT_BIN" "$@" <&0' _ "${args[@]}" >>"$LOGFILE" 2>&1; then
+    log "❌ openconnect 启动失败。查看日志：$LOGFILE"
+    exit 1
+  fi
 }
 
-# 启动后确保 PIDFILE 存在；否则用 pgrep 纠正并写入
-ensure_pidfile() {
-  # 先看指定 pidfile 是否已有
+# 确保 PID 文件可用（必要时兜底用 pgrep）
+ensure_pidfile(){
   if [ -f "$PIDFILE" ]; then
     local p; p="$(cat "$PIDFILE" 2>/dev/null || true)"
     if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then return 0; fi
   fi
-  # 兜底：取“最新”的 openconnect 进程
   local p; p="$(pgrep -n -f "openconnect.*${VPN_HOST}" || true)"
-  if [ -n "$p" ]; then
-    printf "%s" "$p" > "$PIDFILE"
-    return 0
-  fi
+  [ -n "$p" ] && { printf "%s" "$p" > "$PIDFILE"; return 0; }
   return 1
 }
 
-# ---- 子命令：up/down/status/split/unsplit/clean ----
+########## 上下线/状态 ##########
 do_up(){
-  ensure_sudo; get_password
+  [ -n "$VPN_USER" ] || { log "❌ 未设置 VPN_USER（请在 .env 中配置）"; exit 1; }
+
+  save_default_route
   log "🚀 正在连接 VPN..."
-  if run_openconnect >>"$LOGFILE" 2>&1; then
-    log "⌛ 等待进程与接口就绪..."
-    for _ in 1 2 3 4 5 6; do
-      if ensure_pidfile; then break; fi
-      sleep 0.5
-    done
-    if ! ensure_pidfile; then
-      log "❌ 连接失败（未找到 openconnect 进程/PIDFILE）。查看日志：$LOGFILE"
-      exit 1
-    fi
-    if is_running; then
-      local OUTIP; OUTIP="$(curl -4 -s --max-time 3 https://1.1.1.1/cdn-cgi/trace | awk -F= '/^ip=/{print $2}' || true)"
-      [ -z "$OUTIP" ] && OUTIP="$(curl -4 -s --max-time 3 https://api.ipify.org || true)"
-      log "✅ VPN 已连接（认证完成），出口 IP：${OUTIP:-未知}"
-    else
-      log "❌ 连接失败（进程未在运行）。查看日志：$LOGFILE"; exit 1
-    fi
-  else
-    log "❌ openconnect 启动失败。查看日志：$LOGFILE"; exit 1
+  run_openconnect
+  # 等待后台进程就绪
+  for _ in 1 2 3 4 5 6; do
+    if ensure_pidfile; then break; fi
+    sleep 0.5
+  done
+  if ! ensure_pidfile; then
+    log "❌ 连接失败（未找到 openconnect 进程/PIDFILE）。查看日志：$LOGFILE"
+    exit 1
   fi
+  # 出口 IP（仅指当前默认路由下的对外 IP）
+  local outip; outip="$(curl -4 -s --max-time 3 https://api.ipify.org || true)"
+  log "✅ VPN 已连接（认证完成），出口 IP：${outip:-未知}"
 }
 
 do_down(){
-  if ! is_running; then log "未连接。"; [ -f "$PIDFILE" ] && rm -f "$PIDFILE"; exit 0; fi
-  ensure_sudo
+  if ! is_running; then
+    log "未连接。"
+    [ -f "$PIDFILE" ] && rm -f "$PIDFILE"
+    restore_default_route
+    exit 0
+  fi
   local pid; pid="$(cat "$PIDFILE")"
   log "🔌 正在断开 VPN..."
+  ensure_sudo
   sudo kill -INT "$pid" 2>>"$LOGFILE" || true
   for _ in 1 2 3 4 5 6; do kill -0 "$pid" 2>/dev/null && sleep 0.5 || break; done
   kill -0 "$pid" 2>/dev/null && sudo kill -9 "$pid" 2>>"$LOGFILE" || true
   rm -f "$PIDFILE"
+  restore_default_route
+  # 可选：清理日志（开启请在 .env 里设 CLEAN_ON_DOWN=1）
+  [ "${CLEAN_ON_DOWN:-0}" = "1" ] && rm -f "$LOGFILE"
   log "✅ 已断开。"
 }
 
-do_status(){ is_running && echo "✅ 已连接（PID $(cat "$PIDFILE")）。" || echo "❌ 未连接。"; }
-
-# ---- 分流操作（调用子模块函数） ----
-need_split_module(){
-  [ -r "$SPLIT_MODULE" ] || { log "❌ 找不到分流模块：$SPLIT_MODULE"; exit 1; }
-  # shellcheck source=/dev/null
-  . "$SPLIT_MODULE"
+do_status(){
+  if is_running; then
+    echo "✅ 已连接（PID $(cat "$PIDFILE")）。"
+  else
+    echo "❌ 未连接。"
+  fi
 }
 
-do_split(){
-  need_split_module
-  local file="${1:-$DOMAINS_FILE_DEFAULT}"
-  split::add "$file"
-}
-
-do_unsplit(){
-  need_split_module
-  split::del
-}
-
-do_clean() {
-  # 清理所有临时/日志文件
-  rm -f \
-    "$PIDFILE" \
-    "$LOGFILE" \
-    "$SPLIT_ROUTES_FILE" \
-    "$SPLIT_LOGFILE" 2>/dev/null || true
-}
-
-# ---- 参数解析 ----
-# case "${1:-}" in
-#   up)       shift; do_up ;;
-#   down)     shift; do_unsplit; do_down ;;
-#   status)   shift; do_status ;;
-#   split)    shift; do_up; do_split "${1-}";;
-#   unsplit)  shift; do_unsplit ;;
-#   *) echo "用法：$0 {up|down|status|split|unsplit} [domains_file_for_split]"; exit 1 ;;
-# esac
-
-# ========== 统一参数解析 ==========
-SUBCMD=""
-WANT_SPLIT="${AUTO_SPLIT:-0}"
-DOMAINS_FILE="${DOMAINS_FILE_DEFAULT}"
-
-# 取子命令
-if [ $# -gt 0 ]; then
-  case "$1" in
-    up|down|status|split|unsplit|clean) SUBCMD="$1"; shift ;;
-    *) echo "未知子命令：$1"; exit 1 ;;
-  esac
-else
-  cat >&2 <<'USAGE'
-用法：
-  ecnu-vpn.sh up [--split] [--domains FILE]
-  ecnu-vpn.sh down
-  ecnu-vpn.sh status
-  ecnu-vpn.sh split [--domains FILE]
-  ecnu-vpn.sh unsplit
-USAGE
-  exit 1
-fi
-
-# 通用选项（无论 up/down/split 都可出现）
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --split)       WANT_SPLIT=1 ;;
-    --no-split)    WANT_SPLIT=0 ;;
-    --domains)     shift; DOMAINS_FILE="${1:-$DOMAINS_FILE}" ;;
-    --)            shift; break ;;
-    *)             break ;;
-  esac
-  shift || true
-done
-
-# ========== 分发 ==========
-case "$SUBCMD" in
+########## 主流程：按是否 --split 切换脚本 ##########
+case "${SUBCMD}" in
   up)
-    do_up                  # 仅负责连接/认证/日志
     if [ "$WANT_SPLIT" = "1" ]; then
-      do_split
+      # —— 分流模式：vpn-slice —— #
+      make_vpn_slice_wrapper
+      VPN_SCRIPT="$VPN_SLICE_WRAPPER"
+      do_up
+      log "🧭 当前模式：分流（domains.txt 走 VPN，其它直连）"
+    else
+      # —— 全局模式：标准 vpnc-script —— #
+      VPN_SCRIPT="$VPN_SCRIPT_GLOBAL"
+      do_up
+      log "🌐 当前模式：全局（默认路由/DNS 走 VPN）"
     fi
     ;;
+
   down)
-    do_unsplit
-    do_down                # 仅负责断开
+    do_down
     ;;
+
   status)
     do_status
     ;;
-  split)
-    do_split
-    ;;
-  unsplit)
-    do_unsplit
-    ;;
-  clean)
-    do_clean
+
+  *)
+    echo "用法：$0 {up|down|status} [--split|--no-split]"
+    echo "  up            全局模式连接"
+    echo "  up --split    分流模式（仅 domains.txt 走 VPN）"
+    echo "  down          断开并恢复默认路由"
+    echo "  status        查看当前连接状态"
+    exit 1
     ;;
 esac
