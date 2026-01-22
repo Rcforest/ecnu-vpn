@@ -58,10 +58,6 @@ if [ -z "${VPN_SCRIPT_GLOBAL-}" ]; then
 fi
 : "${VPN_SCRIPT_GLOBAL:?未找到标准 vpnc-script；请先 brew install openconnect}"
 
-# vpn-slice（分流模式用）
-VPN_SLICE_BIN="$(command -v vpn-slice || true)"  # 分流时才强制需要
-VPN_SLICE_WRAPPER="$TMPDIR/vpn-slice-wrapper.sh" # 动态生成的小封装
-
 ########## 工具函数 ##########
 log(){ echo "[$(date '+%F %T')] $*" | tee -a "$LOGFILE" >&2; }
 is_running(){ [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
@@ -83,6 +79,7 @@ done
 # Keychain / 环境 读取密码（带清理 & 2FA 拼接）
 get_password() {
   : "${VPN_USER:?VPN_USER must not be empty}"
+  # : "${VPN_PASS_FILE:-./secret.txt}"
   local pass
   if [ -n "${VPN_PASS_FILE-}" ]; then
     [ -r "$VPN_PASS_FILE" ] || { log "❌ VPN_PASS_FILE 不可读：$VPN_PASS_FILE"; exit 1; }
@@ -139,33 +136,97 @@ restore_default_route(){
   fi
 }
 
-# 生成 vpn-slice 的 wrapper（把 domains.txt 展开为参数传给它）
-# 函数：make_vpn_slice_wrapper（替换你脚本里的同名函数）
-make_vpn_slice_wrapper(){
-  : "${VPN_SLICE_BIN:?未找到 vpn-slice；分流需先安装（brew install vpn-slice 或 pipx install vpn-slice）}"
-  cat > "$VPN_SLICE_WRAPPER" <<'EOF'
-#!/bin/sh
-set -eu
+# 生成 split-dns 的 wrapper（解析 domains.txt -> 环境变量 -> 调用 standard vpnc-script）
+make_split_dns_wrapper(){
+  local wrapper="$TMPDIR/vpn-split-wrapper.sh"
+  
+  cat > "$wrapper" <<'EOF'
+#!/bin/bash
+# 动态生成的 split-tunnel wrapper
+set -u
+
 DOMAINS_FILE="__DOMAINS_FILE__"
-VPN_SLICE_BIN="__VPN_SLICE_BIN__"
+REAL_VPNC_SCRIPT="__REAL_VPNC_SCRIPT__"
 
-# 读取 domains.txt（去注释与空行），用 POSIX 方式拼接参数
-DOMAINS_ARGS=""
-while IFS= read -r line || [ -n "$line" ]; do
-  clean="$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
-  [ -z "$clean" ] && continue
-  case "$clean" in \#*) continue ;; esac
-  DOMAINS_ARGS="${DOMAINS_ARGS} ${clean}"
-done < "$DOMAINS_FILE"
+# 1. 解析 domains.txt -> IP 列表
+#    优化：
+#    - 自动追加 www. 前缀（如果你写了 example.com，会自动多解一个 www.example.com）
+#    - 多次 dig (3次) 以尝试捕获更多 CDN 轮询 IP
+RESOLVED_IPS=()
 
-# 调用 vpn-slice：-v 冗长日志；不再带 --no-dns（该参数不存在）
-# shellcheck disable=SC2086
-exec "$VPN_SLICE_BIN" -v $DOMAINS_ARGS
-EOF
-  /usr/bin/sed -i '' "s#__DOMAINS_FILE__#${DOMAINS_FILE}#g" "$VPN_SLICE_WRAPPER"
-  /usr/bin/sed -i '' "s#__VPN_SLICE_BIN__#${VPN_SLICE_BIN}#g" "$VPN_SLICE_WRAPPER"
-  chmod +x "$VPN_SLICE_WRAPPER"
+resolve_domain() {
+  local d="$1"
+  # dig 3次，去重，合并输出
+  local res
+  res="$(for _ in 1 2 3; do dig +short +time=1 +tries=1 A "$d"; done | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+  echo "$res"
 }
+
+if [ -f "$DOMAINS_FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    # 去除首尾空白
+    domain="$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    [ -z "$domain" ] && continue
+    case "$domain" in \#*) continue ;; esac
+    
+    # 原始域名解析
+    ips="$(resolve_domain "$domain")"
+    if [ -n "$ips" ]; then
+      while IFS= read -r ip; do RESOLVED_IPS+=("$ip"); done <<< "$ips"
+    fi
+
+    # 尝试自动加 www. (如果原本没有 www.)
+    if [[ "$domain" != "www."* ]]; then
+       ips_www="$(resolve_domain "www.$domain")"
+       if [ -n "$ips_www" ]; then
+         while IFS= read -r ip; do RESOLVED_IPS+=("$ip"); done <<< "$ips_www"
+       fi
+    fi
+
+  done < "$DOMAINS_FILE"
+fi
+
+# 去重
+SORTED_IPS=($(printf "%s\n" "${RESOLVED_IPS[@]}" | sort -u))
+
+echo "==> [Split Tunneling] Resolved ${#SORTED_IPS[@]} IPs from $DOMAINS_FILE (incl. www & retries)" >&2
+
+# 2. 设置 CISCO_SPLIT_INC_* 环境变量
+#    这是 vpnc-script 识别分流列表的标准变量
+#    格式：
+#      CISCO_SPLIT_INC=N
+#      CISCO_SPLIT_INC_0_ADDR=...
+#      CISCO_SPLIT_INC_0_MASK=...
+#      CISCO_SPLIT_INC_0_MASKLEN=32
+
+count=0
+for ip in "${SORTED_IPS[@]}"; do
+  export CISCO_SPLIT_INC_${count}_ADDR="$ip"
+  export CISCO_SPLIT_INC_${count}_MASK="255.255.255.255"
+  export CISCO_SPLIT_INC_${count}_MASKLEN="32"
+  count=$((count + 1))
+done
+export CISCO_SPLIT_INC="$count"
+
+# 4. 关键修正：防止 vpnc-script 修改系统 DNS
+#    在分流模式下，如果服务端推送了内网 DNS (如 10.x.x.x)，但该 IP 不在路由表中，
+#    会导致系统 DNS 变为不可达，从而"断网"。
+#    我们只想要路由分流，不需要 DNS 变更（使用本地公网 DNS 解析公网学术 IP 即可）。
+unset INTERNAL_IP4_DNS
+unset INTERNAL_IP6_DNS
+unset CISCO_DEF_DOMAIN
+unset CISCO_SPLIT_DNS
+
+# 5. 调用真正的 vpnc-script
+exec "$REAL_VPNC_SCRIPT"
+EOF
+
+  /usr/bin/sed -i '' "s#__DOMAINS_FILE__#${DOMAINS_FILE}#g" "$wrapper"
+  /usr/bin/sed -i '' "s#__REAL_VPNC_SCRIPT__#${VPN_SCRIPT_GLOBAL}#g" "$wrapper"
+  chmod +x "$wrapper"
+  VPN_SCRIPT="$wrapper"
+}
+
 
 # 启动 openconnect（密码走 stdin；记录 PIDFILE；追加日志）
 run_openconnect(){
@@ -254,14 +315,14 @@ do_status(){
 }
 
 ########## 主流程：按是否 --split 切换脚本 ##########
-case "${SUBCMD}" in
+case "${SUBCMD:-}" in
   up)
     if [ "$WANT_SPLIT" = "1" ]; then
-      # —— 分流模式：vpn-slice —— #
-      make_vpn_slice_wrapper
-      VPN_SCRIPT="$VPN_SLICE_WRAPPER"
+      # —— 分流模式：Custom Split DNS —— #
+      make_split_dns_wrapper
+      # VPN_SCRIPT 已在 make_split_dns_wrapper 中被指向新 wrapper
       do_up
-      log "🧭 当前模式：分流（domains.txt 走 VPN，其它直连）"
+      log "🧭 当前模式：分流（$DOMAINS_FILE 走 VPN，其它直连）"
     else
       # —— 全局模式：标准 vpnc-script —— #
       VPN_SCRIPT="$VPN_SCRIPT_GLOBAL"
