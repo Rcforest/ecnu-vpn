@@ -90,16 +90,68 @@ get_password() {
     log "🔑 已从环境变量读取密码"
   else
     log "🔑 正在从钥匙串读取密码（account=$VPN_USER service=${KEYCHAIN_LABEL}）"
-    if pass="$(
+    # Shortcut 环境下 $HOME 可能为空，需要从系统获取或猜测
+    local home_dir="${HOME:-}"
+    if [ -z "$home_dir" ]; then
+        # 尝试通过 id -P 获取 (macOS specific)
+        home_dir="$(id -P "$(id -u)" 2>/dev/null | cut -d: -f9)" || true
+    fi
+    [ -z "$home_dir" ] && home_dir="/Users/$(id -un)"
+
+    # 尝试显式指定 login keychain
+    local kc_path="${home_dir}/Library/Keychains/login.keychain-db"
+    [ -f "$kc_path" ] || kc_path="${home_dir}/Library/Keychains/login.keychain"
+
+    # DEBUG: 输出调试信息到日志
+    log "🔍 Debug: User=$(id -un), UID=$(id -u), HOME=$home_dir SUDO_USER=${SUDO_USER-}"
+
+    local sec_out
+    # 尝试 1: 直接读取 (当前用户)
+    if sec_out="$(
       /usr/bin/perl -e 'alarm 3; exec @ARGV' \
         /usr/bin/security find-generic-password \
-        -a "$VPN_USER" -s "$KEYCHAIN_LABEL" -w </dev/null 2>/dev/null
-    )"; then :; elif [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER-}" ] && pass="$(
-      /usr/bin/perl -e 'alarm 3; exec @ARGV' \
-        sudo -u "$SUDO_USER" /usr/bin/security find-generic-password \
-        -a "$VPN_USER" -s "$KEYCHAIN_LABEL" -w </dev/null 2>/dev/null
-    )"; then :; else
+        -a "$VPN_USER" -s "$KEYCHAIN_LABEL" -w "$kc_path" 2>&1
+    )"; then
+      pass="$sec_out"
+    elif [ "$(id -u)" -eq 0 ]; then
+      # 尝试 2: 如果是 Root，尝试切换回真实用户读取
+      # Shortcuts sudo 环境下 SUDO_USER 可能丢失，尝试作为脚本拥有者兜底
+      local real_user="${SUDO_USER-}"
+      local real_uid=""
+      if [ -z "$real_user" ]; then
+         real_user="$(stat -f '%Su' "$SCRIPT_DIR")"
+         real_uid="$(stat -f '%u' "$SCRIPT_DIR")"
+         log "⚠️ SUDO_USER 为空，推断真实用户为脚本拥有者: $real_user ($real_uid)"
+      else
+         real_uid="$(id -u "$real_user")"
+      fi
+      
+      local user_home_kc=""
+      if [ -d "/Users/$real_user" ]; then
+         user_home_kc="/Users/$real_user/Library/Keychains/login.keychain-db"
+         [ -f "$user_home_kc" ] || user_home_kc="/Users/$real_user/Library/Keychains/login.keychain"
+      fi
+      
+      log "🔍 Debug (Root): Switching to user=$real_user (UID=$real_uid) via launchctl, TargetKC=$user_home_kc"
+
+      local sec_err
+      # 关键修正：使用 launchctl asuser 在用户 session 上下文中执行，
+      # 这比单纯 sudo -u 更能获得正确的 Keychain 访问权限。
+      if sec_out="$(
+        launchctl asuser "$real_uid"  \
+        /usr/bin/security find-generic-password \
+          -a "$VPN_USER" -s "$KEYCHAIN_LABEL" -w ${user_home_kc:+"$user_home_kc"} 2>&1
+      )"; then
+         pass="$sec_out"
+      else
+         sec_err="$sec_out"
+         log "❌ 无法从钥匙串读取密码（account=$VPN_USER service=${KEYCHAIN_LABEL}）"
+         log "   Root尝试失败。错误详情：$sec_err"
+         exit 1
+      fi
+    else
       log "❌ 无法从钥匙串读取密码（account=$VPN_USER service=${KEYCHAIN_LABEL}）"
+      log "  错误详情：$sec_out"
       echo "   解决A：security add-generic-password -a \"$VPN_USER\" -s \"$KEYCHAIN_LABEL\" -w" >&2
       echo "   解决B：在 .env 中设置 VPN_PASS 或 VPN_PASS_FILE" >&2
       exit 1
