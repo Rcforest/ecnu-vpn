@@ -4,7 +4,7 @@ set -euo pipefail
 ############################################################
 # ECNU VPN one-touch (macOS)
 # - 默认：全局模式（标准 vpnc-script 改默认路由/DNS）
-# - 分流：--split 使用 vpn-slice，仅清单域名走 VPN
+# - 分流：--split 仅将配置的域名/IP 走 VPN
 # - 密码来源：VPN_PASS_FILE > VPN_PASS > Keychain
 # - PID/日志：可通过 .env 配置；相对路径会按脚本目录绝对化
 ############################################################
@@ -28,6 +28,9 @@ TMPDIR="${TMPDIR:-$SCRIPT_DIR/tmp}"
 LOGFILE="${LOGFILE:-$TMPDIR/ecnu-vpn.log}"
 PIDFILE="${PIDFILE:-$TMPDIR/openconnect-ecnu.pid}"
 DOMAINS_FILE="${DOMAINS_FILE:-$SCRIPT_DIR/domains.txt}"
+# 空格分隔的 IPv4 地址；每个地址以 /32 走 VPN（适用于 SSH 等固定主机）
+SPLIT_IPS="${SPLIT_IPS:-}"
+export SPLIT_IPS
 
 # 默认行为：不开 split => 全局模式
 WANT_SPLIT="${AUTO_SPLIT:-0}"
@@ -60,7 +63,24 @@ fi
 
 ########## 工具函数 ##########
 log(){ echo "[$(date '+%F %T')] $*" | tee -a "$LOGFILE" >&2; }
-is_running(){ [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+pid_is_openconnect(){
+  local pid="$1" command
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+
+  command="$(ps -p "$pid" -o comm= 2>/dev/null | tr -d '[:space:]')"
+  if [ -z "$command" ]; then
+    # openconnect 由 sudo 启动时，普通用户可能无法读取 root 进程信息。
+    # 此时允许 sudo 正常认证，优先保证 status 的结果正确。
+    command="$(sudo /bin/ps -p "$pid" -o comm= 2>/dev/null | tr -d '[:space:]')"
+  fi
+  [ "${command##*/}" = "openconnect" ]
+}
+is_running(){
+  [ -r "$PIDFILE" ] || return 1
+  local pid
+  pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+  pid_is_openconnect "$pid"
+}
 ensure_sudo(){ [ "$(id -u)" -eq 0 ] || sudo -v; }
 
 # 解析参数
@@ -188,7 +208,7 @@ restore_default_route(){
   fi
 }
 
-# 生成 split-dns 的 wrapper（解析 domains.txt -> 环境变量 -> 调用 standard vpnc-script）
+# 生成 split wrapper（解析 domains.txt 和 SPLIT_IPS -> 环境变量 -> 调用 standard vpnc-script）
 make_split_dns_wrapper(){
   local wrapper="$TMPDIR/vpn-split-wrapper.sh"
   
@@ -200,11 +220,21 @@ set -u
 DOMAINS_FILE="__DOMAINS_FILE__"
 REAL_VPNC_SCRIPT="__REAL_VPNC_SCRIPT__"
 
-# 1. 解析 domains.txt -> IP 列表
+# 1. 解析 domains.txt 与 SPLIT_IPS -> IP 列表
 #    优化：
 #    - 自动追加 www. 前缀（如果你写了 example.com，会自动多解一个 www.example.com）
 #    - 多次 dig (3次) 以尝试捕获更多 CDN 轮询 IP
 RESOLVED_IPS=()
+
+is_ipv4() {
+  local ip="$1" octet
+  local -a octets
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS=. read -r -a octets <<< "$ip"
+  for octet in "${octets[@]}"; do
+    (( 10#$octet <= 255 )) || return 1
+  done
+}
 
 resolve_domain() {
   local d="$1"
@@ -238,10 +268,21 @@ if [ -f "$DOMAINS_FILE" ]; then
   done < "$DOMAINS_FILE"
 fi
 
+# 固定 IPv4：适用于不能通过 DNS 解析的校内主机。
+# SPLIT_IPS 由主脚本导出；仅接受空格分隔的 IPv4，避免意外生成错误路由。
+read -r -a FIXED_IPS <<< "${SPLIT_IPS:-}"
+for ip in "${FIXED_IPS[@]}"; do
+  if ! is_ipv4 "$ip"; then
+    echo "==> [Split Tunneling] Invalid IPv4 in SPLIT_IPS: $ip" >&2
+    exit 1
+  fi
+  RESOLVED_IPS+=("$ip")
+done
+
 # 去重
 SORTED_IPS=($(printf "%s\n" "${RESOLVED_IPS[@]}" | sort -u))
 
-echo "==> [Split Tunneling] Resolved ${#SORTED_IPS[@]} IPs from $DOMAINS_FILE (incl. www & retries)" >&2
+echo "==> [Split Tunneling] Prepared ${#SORTED_IPS[@]} split IPs from $DOMAINS_FILE and SPLIT_IPS" >&2
 
 # 2. 设置 CISCO_SPLIT_INC_* 环境变量
 #    这是 vpnc-script 识别分流列表的标准变量
@@ -260,7 +301,7 @@ for ip in "${SORTED_IPS[@]}"; do
 done
 export CISCO_SPLIT_INC="$count"
 
-# 4. 关键修正：防止 vpnc-script 修改系统 DNS
+# 3. 关键修正：防止 vpnc-script 修改系统 DNS
 #    在分流模式下，如果服务端推送了内网 DNS (如 10.x.x.x)，但该 IP 不在路由表中，
 #    会导致系统 DNS 变为不可达，从而"断网"。
 #    我们只想要路由分流，不需要 DNS 变更（使用本地公网 DNS 解析公网学术 IP 即可）。
@@ -308,10 +349,7 @@ run_openconnect(){
 
 # 确保 PID 文件可用（必要时兜底用 pgrep）
 ensure_pidfile(){
-  if [ -f "$PIDFILE" ]; then
-    local p; p="$(cat "$PIDFILE" 2>/dev/null || true)"
-    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then return 0; fi
-  fi
+  is_running && return 0
   local p; p="$(pgrep -n -f "openconnect.*${VPN_HOST}" || true)"
   [ -n "$p" ] && { printf "%s" "$p" > "$PIDFILE"; return 0; }
   return 1

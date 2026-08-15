@@ -14,11 +14,12 @@
 在使用前，请确保已安装以下依赖：
 
 ```bash
-brew install openconnect vpn-slice
+brew install openconnect
 ```
 
 - openconnect：核心 VPN 客户端
-- vpn-slice：分流模式所需的路由/DNS 工具
+- openconnect 附带的 vpnc-script：负责设置 VPN 路由
+- 分流模式还需要 macOS 自带或已安装的 `dig` 用于解析域名清单
 
 
 
@@ -54,6 +55,7 @@ AUTO_SPLIT=1
 DOMAINS_FILE=./domains.txt 
 ```
 - 当 AUTO_SPLIT=1 时，脚本会自动读取 DOMAINS_FILE 中的域名列表，并为这些域名添加 VPN 路由；
+- 如需让固定 IP（例如 SSH 主机）走 VPN，可仅在个人 `.env` 中设置空格分隔的 `SPLIT_IPS`；每个地址添加一条精确 `/32` 路由，不会改变其他外网流量的默认路由；
 - DOMAINS_FILE 是一个 纯文本文件，每行一个域名，例如：
 
 ```bash
@@ -62,6 +64,23 @@ dl.acm.org
 link.springer.com
 sciencedirect.com
 ```
+
+### 校园网服务器分流
+
+当实验服务器只能从校园 VPN 访问，或需要 SSH 连接固定 IPv4 的校园网主机时，在个人 `.env` 中添加 `SPLIT_IPS`。使用 SSH 跳板机时，应同时填入跳板机和目标服务器的 IP：
+
+```bash
+# 用实际 IPv4 替换尖括号内的占位符
+SPLIT_IPS="<jump-host-ip> <campus-server-ip>"
+```
+
+随后以分流模式连接：
+
+```bash
+sudo bash ./ecnu-vpn.sh up --split
+```
+
+脚本会为每个地址安装精确 `/32` VPN 路由；这些校园服务器流量进入 VPN，未列出的本地与外网流量仍使用原有默认路由。
 
 
 
@@ -83,7 +102,7 @@ sudo bash ./ecnu-vpn.sh up
 sudo bash ./ecnu-vpn.sh up --split
 ```
 
-- 仅将 .env 中列出的域名流量走 VPN
+- 仅将 `DOMAINS_FILE` 中的域名和 `SPLIT_IPS` 中的固定 IP 流量走 VPN
 - 其他网站保持本地网络出口
 - 推荐用于下载论文、访问数据库等学术场景
 
