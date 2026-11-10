@@ -1,0 +1,35 @@
+# ECNU aTrust VPN（hagb/docker-atrust）
+#
+# 首次：cp atrust.env.example atrust.env 并设置 VNC 密码，然后
+#   docker compose up -d
+#   ./atrust-vpn.sh up（Keychain + HTTP CAS；需要额外认证时打开浏览器）
+#   或在宿主机浏览器打开 https://vpn.ecnu.edu.cn 完成学校 SSO
+#   54631 是网页与客户端通信的 HTTPS 接口，不是独立登录网页
+# 之后：./atrust-vpn.sh up 复用已有容器；客户端数据保存在 ./atrust-data
+#
+# 对外提供：SOCKS5 127.0.0.1:1080，HTTP 127.0.0.1:8888
+
+services:
+  atrust:
+    image: hagb/docker-atrust:latest
+    container_name: ecnu-atrust
+    restart: unless-stopped
+    devices:
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      # 让 54631 网页登录端口能从宿主机访问
+      - net.ipv4.conf.default.route_localnet=1
+    environment:
+      - URLWIN=1
+    env_file:
+      - path: ./atrust.env       # PASSWORD=<VNC 密码>
+        required: false
+    volumes:
+      - ./atrust-data:/root      # 持久化服务器地址、账号与登录状态
+    ports:
+      - "127.0.0.1:5901:5901"    # VNC
+      - "127.0.0.1:1080:1080"    # SOCKS5
+      - "127.0.0.1:8888:8888"    # HTTP 代理
+      - "127.0.0.1:54631:54631"  # aTrust 网页登录

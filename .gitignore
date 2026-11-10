@@ -1,6 +1,11 @@
+# 私有配置
 .env
-*.log
-*.pid
-tmp/
-.DS_Store
+atrust.env
 clash-config.yaml
+
+# 运行时数据：aTrust 客户端状态、登录 Cookie、锁
+atrust-data/
+tmp/
+
+__pycache__/
+.DS_Store
