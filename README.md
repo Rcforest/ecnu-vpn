@@ -80,14 +80,29 @@ security add-generic-password -a "<学号>" -s ECNU_VPN -w   # 回车后按提�
 | `127.0.0.1:5901` | VNC，可查看容器内的 aTrust 界面 |
 | `127.0.0.1:54631` | aTrust 客户端本地接口，登录脚本使用 |
 
-示例：
+命令行工具直接指定代理即可，例如：
 
 ```bash
 curl -x socks5h://127.0.0.1:1080 https://example.ecnu.edu.cn
-ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@<校内主机>
 ```
 
-`ssh` 示例里的 `nc -X` 是 OpenBSD 版 netcat 的参数，macOS 自带这个版本；Linux 上可能要安装 `netcat-openbsd`，或者改用 `ncat --proxy-type socks5 --proxy 127.0.0.1:1080 %h %p`。
+### SSH 访问校内服务器
+
+在 `~/.ssh/config` **最前面**加上下面这段，VPN 连上时自动走代理，没连上（比如在校内）时直连：
+
+```sshconfig
+Match originalhost lab-20 exec "/bin/bash /path/to/ecnu-vpn/atrust-vpn.sh status >/dev/null 2>&1"
+    ProxyCommand /usr/bin/nc -X 5 -x 127.0.0.1:1080 %h %p
+Host *
+
+Host lab-20
+    HostName <服务器 IP>
+    User <用户名>
+```
+
+然后 `ssh lab-20` 就行。有多台服务器时，把别名都写进 `Match originalhost`，用逗号分隔。Linux 上 `nc -X` 需要安装 `netcat-openbsd`。
+
+### 浏览器与分流规则
 
 浏览器可以使用 SwitchyOmega 等插件，或者在 Clash 规则里把校内域名转发到上面的 SOCKS5 端口。
 
