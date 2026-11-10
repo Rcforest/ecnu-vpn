@@ -1,6 +1,6 @@
 # ECNU aTrust VPN（hagb/docker-atrust）
 #
-# 首次：cp atrust.env.example atrust.env 并设置 VNC 密码，然后
+# 首次：cp .env.example .env 并填写（VNC_PASSWORD 等），然后
 #   docker compose up -d
 #   ./atrust-vpn.sh up（Keychain + HTTP CAS；需要额外认证时打开浏览器）
 #   或在宿主机浏览器打开 https://vpn.ecnu.edu.cn 完成学校 SSO
@@ -23,9 +23,10 @@ services:
       - net.ipv4.conf.default.route_localnet=1
     environment:
       - URLWIN=1
-    env_file:
-      - path: ./atrust.env       # PASSWORD=<VNC 密码>
-        required: false
+      # 只从 .env 取 VNC_PASSWORD（compose 自动读取 .env 做变量替换），
+      # 不用 env_file，避免把 VPN_PASS 等其他变量带进容器。
+      # 为空时镜像不修改 VNC 密码（默认 password）。
+      - PASSWORD=${VNC_PASSWORD:-}
     volumes:
       - ./atrust-data:/root      # 持久化服务器地址、账号与登录状态
     ports:

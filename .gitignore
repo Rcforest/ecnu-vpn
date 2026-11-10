@@ -1,6 +1,5 @@
 # 私有配置
 .env
-atrust.env
 clash-config.yaml
 
 # 运行时数据：aTrust 客户端状态、登录 Cookie、锁

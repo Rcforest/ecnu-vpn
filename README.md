@@ -10,24 +10,19 @@
 
 ## 依赖
 
-- Docker 和 Docker Compose v2.24 或更新版本（`docker compose`；`docker-compose.yml` 里 `env_file` 的 `required` 写法需要这个版本）。macOS 可用 [OrbStack](https://orbstack.dev/) 或 Docker Desktop；Linux 需要宿主机有 `/dev/net/tun`，当前用户能直接运行 `docker`（例如已加入 `docker` 组）
+- Docker 和 Docker Compose v2（`docker compose`）。macOS 可用 [OrbStack](https://orbstack.dev/) 或 Docker Desktop；Linux 需要宿主机有 `/dev/net/tun`，当前用户能直接运行 `docker`（例如已加入 `docker` 组）
 - Bash、Python 3.9+（只用标准库）
 - `/usr/bin/curl`、`/usr/bin/openssl`。macOS 自带；Linux 发行版通常也装在这里，没有的话用包管理器安装
 - 可选：macOS 的 `security`（钥匙串，系统自带）；Linux 上用于打开浏览器的 `xdg-open`
 
 ## 首次配置
 
-**1. 创建容器**
+所有配置都在一个 `.env` 文件里。
+
+**1. 填写配置**
 
 ```bash
-cp atrust.env.example atrust.env   # 填写 VNC 密码（不是学校密码）
-docker compose up -d
-```
-
-**2. 配置账号**
-
-```bash
-cp .env.example .env               # 填写 VPN_USER（学号 / 工号）
+cp .env.example .env
 chmod 600 .env
 ```
 
@@ -36,8 +31,9 @@ chmod 600 .env
 | `VPN_USER` | 学号 / 工号 | 无，必填 |
 | `KEYCHAIN_LABEL` | macOS 钥匙串条目的服务名 | `ECNU_VPN` |
 | `VPN_PASS` | 学校密码。macOS 上只在钥匙串读不到时使用；Linux 上必填 | 不设置 |
+| `VNC_PASSWORD` | 容器内 VNC 的密码（不是学校密码，最多 8 位） | 不修改，镜像默认为 `password` |
 
-**3. 提供学校密码**
+**2. 提供学校密码**
 
 脚本按下面的顺序找密码：
 
@@ -53,7 +49,13 @@ security add-generic-password -a "<学号>" -s ECNU_VPN -w   # 回车后按提�
 
 脚本第一次读取时，macOS 可能会弹窗请求授权。要用的是钥匙串里的“通用密码”条目，Apple“密码”App 里保存的网站密码读不到。
 
-*Linux，或不想用钥匙串时：* 在 `.env` 里写 `VPN_PASS=<密码>`。密码会以明文保存在磁盘上，`.env` 已被 git 忽略，但请确保文件权限是 `600`。
+*Linux，或不想用钥匙串时：* 在 `.env` 里写 `VPN_PASS='<密码>'`（用单引号，避免特殊字符被解析）。密码会以明文保存在磁盘上，`.env` 已被 git 忽略，但请确保文件权限是 `600`。
+
+**3. 创建容器**
+
+```bash
+docker compose up -d
+```
 
 ## 使用
 
@@ -143,8 +145,7 @@ rules:
 atrust-vpn.sh        入口：启动容器、加锁，调用登录脚本
 atrust-login.py      CAS 登录，并把票据交给 aTrust 客户端
 docker-compose.yml   aTrust 容器定义
-.env.example         账号配置模板（复制为 .env）
-atrust.env.example   VNC 密码模板（复制为 atrust.env）
+.env.example         配置模板（复制为 .env）
 domains.txt          校内系统与学术网站域名清单，供配置分流规则参考
 raycast/             Raycast 脚本
 tests/               单元测试（全部 mock，不访问网络）
