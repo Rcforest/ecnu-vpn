@@ -1,0 +1,28 @@
+# 需要校园网出口的域名（校内系统、学术网站），供配置代理分流规则时参考
+# （例如在 Clash / SwitchyOmega 中把这些域名转发到 SOCKS5 127.0.0.1:1080）。
+# 脚本本身不读取此文件。每行一个域名，# 开头为注释。
+#
+# ===== 校内系统 =====
+# 按后缀匹配，覆盖教务、图书馆、门户、内网服务等所有 *.ecnu.edu.cn 站点。
+# 例外：vpn.ecnu.edu.cn 和 sso.ecnu.edu.cn 是 VPN 登录本身要用的地址，
+# 规则里应放在后缀规则之前并设为直连（DIRECT），否则未连接时登录不了。
+ecnu.edu.cn
+
+# ===== 常见CS论文与期刊网站 =====
+ieeexplore.ieee.org
+ieee.org
+dl.acm.org
+acm.org
+usenix.org
+link.springer.com
+springer.com
+sciencedirect.com
+onlinelibrary.wiley.com
+wiley.com
+nature.com
+aclanthology.org
+openreview.net
+papers.nips.cc
+proceedings.neurips.cc
+openaccess.thecvf.com
+icml.cc

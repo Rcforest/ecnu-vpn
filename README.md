@@ -91,6 +91,22 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@<校内主机>
 
 浏览器可以使用 SwitchyOmega 等插件，或者在 Clash 规则里把校内域名转发到上面的 SOCKS5 端口。
 
+[`domains.txt`](domains.txt) 整理了校内系统（`*.ecnu.edu.cn`）和一批常用的学术网站域名（IEEE、ACM、Springer、Elsevier、NeurIPS、CVF 等），配置分流规则时可以参考。注意 `vpn.ecnu.edu.cn` 和 `sso.ecnu.edu.cn` 是 VPN 登录本身要用的地址，要放在 `ecnu.edu.cn` 规则之前并设为直连，否则还没连上 VPN 时就登录不了。例如在 Clash 里写成：
+
+```yaml
+proxies:
+  - { name: ECNU, type: socks5, server: 127.0.0.1, port: 1080 }
+rules:
+  - DOMAIN,vpn.ecnu.edu.cn,DIRECT
+  - DOMAIN,sso.ecnu.edu.cn,DIRECT
+  - DOMAIN-SUFFIX,ecnu.edu.cn,ECNU
+  - DOMAIN-SUFFIX,ieee.org,ECNU
+  - DOMAIN-SUFFIX,acm.org,ECNU
+  # ……其余域名同理
+```
+
+脚本本身不读取这个文件，增删域名不影响连接。
+
 ### Raycast（仅 macOS）
 
 `raycast/` 下有两个 [Raycast Script Commands](https://github.com/raycast/script-commands)，把该目录加入 Raycast 即可使用：
@@ -114,6 +130,7 @@ atrust-login.py      CAS 登录，并把票据交给 aTrust 客户端
 docker-compose.yml   aTrust 容器定义
 .env.example         账号配置模板（复制为 .env）
 atrust.env.example   VNC 密码模板（复制为 atrust.env）
+domains.txt          校内系统与学术网站域名清单，供配置分流规则参考
 raycast/             Raycast 脚本
 tests/               单元测试（全部 mock，不访问网络）
 atrust-data/         容器内客户端的持久化数据（已忽略）
